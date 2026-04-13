@@ -28,7 +28,7 @@ router.post('/create-order', async (req, res) => {
         const order = await razorpay.orders.create({
             amount: Math.round(amount), // amount in paise
             currency,
-            receipt: `gh_${garageId}_${Date.now()}`,
+            receipt: `gh_${garageId.substring(0, 8)}_${Date.now()}`,
             notes: {
                 garageId,
                 planId,
