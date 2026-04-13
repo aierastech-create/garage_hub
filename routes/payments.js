@@ -93,7 +93,7 @@ router.post('/verify', async (req, res) => {
         const endDate = _calcEndDate(now, duration);
 
         // Write subscription to Firestore
-        const subRef = await db.collection('subscriptions').add({
+        const subData = {
             garageId,
             planId,
             planName: planName || '',
@@ -105,6 +105,19 @@ router.post('/verify', async (req, res) => {
             endDate,
             status: 'active',
             createdAt: new Date(),
+        };
+
+        const subRef = await db.collection('subscriptions').add(subData);
+
+        // Update garage document with active subscription
+        await db.collection('garages').doc(garageId).update({
+            subscription: {
+                planId,
+                planName: planName || '',
+                startDate: now,
+                endDate,
+                status: 'active',
+            },
         });
 
         return res.json({
