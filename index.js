@@ -24,14 +24,11 @@ app.use(
             callback(new Error(`CORS: origin '${origin}' not allowed.`));
         },
         methods: ['GET', 'POST', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'x-razorpay-signature'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
     })
 );
 
 // ── Body Parsers ───────────────────────────────────────────────────────────
-// Raw body needed for webhook verification — mount BEFORE json() middleware
-app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
