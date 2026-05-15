@@ -1,20 +1,31 @@
+'use strict';
+
 const express = require('express');
 const router = express.Router();
 const { db } = require('../lib/firebase');
+const {
+    verifySubscriptionPurchase,
+    acknowledgeSubscriptionPurchase,
+} = require('../lib/googlePlay').default;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payments/verify
+// ─────────────────────────────────────────────────────────────────────────────
 /**
- * POST /api/payments/verify
- * Body: { purchaseId, purchaseToken, productId, serverVerificationData, source, garageId, planId, planName, duration, price }
+ * Body: {
+ *   purchaseId, purchaseToken, productId, serverVerificationData,
+ *   source, garageId, planId, planName, duration, price
+ * }
  *
- * Verifies App Store / Google Play purchase and activates subscription in Firestore.
+ * Verifies a Google Play subscription purchase and activates it in Firestore.
  */
 router.post('/verify', async (req, res) => {
     try {
         const {
             purchaseId,
-            purchaseToken, // For Google/Apple validation
+            purchaseToken,
             productId,
-            source, // e.g., 'app_store', 'play_store'
+            source,
             garageId,
             planId,
             planName,
@@ -22,36 +33,27 @@ router.post('/verify', async (req, res) => {
             price,
         } = req.body;
 
-        if (!purchaseToken || !productId || !source) {
-            console.warn('Missing basic IAP fields for verify, skipping strict checks');
-        }
-
+        // ── Basic input validation ────────────────────────────────────────────
         if (!garageId || !planId) {
             return res.status(400).json({ error: 'garageId and planId are required.' });
         }
-
-        // ==========================================
-        // TODO: Validate Receipt with Apple / Google
-        // ==========================================
-        // Currently, this blindly trusts the client. You MUST implement real validation either
-        // manually via googleapis & app store api, or using a package like google-play-billing-validator
-        // to prevent users from bypassing payment. See Implementation Plan.
-        // Example logic for Google Play:
-        // const isValid = await verifyGooglePlayPurchase(purchaseToken, productId);
-        // if (!isValid) return res.status(400).json({ error: 'Invalid purchase token.' });
-        // ==========================================
-
-        const isValid = true; // Temporary stub
-
-        if (!isValid) {
-            return res.status(400).json({ error: 'Payment verification failed. Invalid receipt.' });
+        if (!purchaseToken || !productId) {
+            return res.status(400).json({ error: 'purchaseToken and productId are required.' });
         }
 
-        // Calculate end date based on duration
+        // ── Google Play verification ──────────────────────────────────────────
+        // For Google Play, the serverVerificationData IS the purchaseToken.
+        // We only call the real API when source is 'play_store'.
+        if (source === 'play_store') {
+            await verifySubscriptionPurchase(productId, purchaseToken);
+            // Throws if the token is invalid, expired, or payment is pending.
+        }
+        // Apple / other sources can be added here in the future.
+
+        // ── Persist subscription ──────────────────────────────────────────────
         const now = new Date();
         const endDate = _calcEndDate(now, duration);
 
-        // Write subscription to Firestore
         const subData = {
             garageId,
             planId,
@@ -65,12 +67,11 @@ router.post('/verify', async (req, res) => {
             startDate: now,
             endDate,
             status: 'active',
-            createdAt: new Date(),
+            createdAt: now,
         };
 
         const subRef = await db.collection('subscriptions').add(subData);
 
-        // Update garage document with active subscription
         await db.collection('garages').doc(garageId).update({
             subscription: {
                 planId,
@@ -81,6 +82,11 @@ router.post('/verify', async (req, res) => {
             },
         });
 
+        // ── Acknowledge so Google doesn't auto-refund after 3 days ───────────
+        if (source === 'play_store') {
+            await acknowledgeSubscriptionPurchase(productId, purchaseToken);
+        }
+
         return res.json({
             success: true,
             subscriptionId: subRef.id,
@@ -88,12 +94,19 @@ router.post('/verify', async (req, res) => {
         });
     } catch (err) {
         console.error('[verify]', err);
-        return res.status(500).json({ error: err.message || 'Verification failed.' });
+        // Surface clear error for invalid purchase tokens
+        const msg =
+            err.message?.includes('invalid') || err.message?.includes('expired')
+                ? 'Invalid or expired purchase token.'
+                : err.message || 'Verification failed.';
+        return res.status(400).json({ error: msg });
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/payments/subscription/:garageId
+// ─────────────────────────────────────────────────────────────────────────────
 /**
- * GET /api/payments/subscription/:garageId
  * Returns the active subscription for a garage.
  */
 router.get('/subscription/:garageId', async (req, res) => {
@@ -117,7 +130,6 @@ router.get('/subscription/:garageId', async (req, res) => {
         const isExpired = endDate < new Date();
 
         if (isExpired) {
-            // Auto-expire in Firestore
             await doc.ref.update({ status: 'expired' });
             return res.json({ active: false, subscription: null });
         }
@@ -137,7 +149,169 @@ router.get('/subscription/:garageId', async (req, res) => {
     }
 });
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payments/rtdn-webhook
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Receives Real-Time Developer Notifications (RTDN) from Google Pub/Sub.
+ *
+ * Set up:
+ *  1. Create a Pub/Sub topic in Google Cloud Console.
+ *  2. In Play Console → Monetization → Real-Time Dev Notifications, set the topic.
+ *  3. Create a push subscription pointing to:
+ *     https://<your-backend-domain>/api/payments/rtdn-webhook
+ *
+ * Ref: https://developer.android.com/google/play/billing/rtdn-reference
+ */
+router.post('/rtdn-webhook', async (req, res) => {
+    // Always respond 200 first; Pub/Sub re-delivers on non-2xx.
+    res.sendStatus(200);
+
+    try {
+        const body = req.body;
+
+        // Pub/Sub wraps the payload in { message: { data: '<base64>' } }
+        const b64 = body?.message?.data;
+        if (!b64) {
+            console.warn('[rtdn-webhook] No message.data in payload');
+            return;
+        }
+
+        let notification;
+        try {
+            const json = Buffer.from(b64, 'base64').toString('utf8');
+            notification = JSON.parse(json);
+        } catch {
+            console.warn('[rtdn-webhook] Failed to decode Pub/Sub message');
+            return;
+        }
+
+        const subNotification = notification?.subscriptionNotification;
+        if (!subNotification) {
+            // Could be a test notification or other type – ignore silently
+            return;
+        }
+
+        const { notificationType, purchaseToken, subscriptionId } = subNotification;
+
+        console.log(`[rtdn-webhook] type=${notificationType} subscriptionId=${subscriptionId}`);
+
+        // Notification type reference:
+        // 1  SUBSCRIPTION_RECOVERED        – recovered from account hold
+        // 2  SUBSCRIPTION_RENEWED          – renewed
+        // 3  SUBSCRIPTION_CANCELED         – voluntarily canceled
+        // 4  SUBSCRIPTION_PURCHASED        – new purchase (handled via /verify)
+        // 5  SUBSCRIPTION_ON_HOLD          – entered account hold
+        // 6  SUBSCRIPTION_IN_GRACE_PERIOD  – in grace period
+        // 7  SUBSCRIPTION_RESTARTED        – restarted from canceled state
+        // 12 SUBSCRIPTION_EXPIRED          – fully expired
+        // 13 SUBSCRIPTION_REVOKED          – revoked immediately
+
+        switch (notificationType) {
+            case 1: // RECOVERED
+            case 2: // RENEWED
+            case 7: // RESTARTED
+                await _handleRenewal(subscriptionId, purchaseToken);
+                break;
+
+            case 3:  // CANCELED
+            case 5:  // ON_HOLD
+            case 6:  // GRACE_PERIOD (still usable – mark as grace_period)
+            case 12: // EXPIRED
+            case 13: // REVOKED
+                await _handleCancellation(subscriptionId, purchaseToken, notificationType);
+                break;
+
+            default:
+                console.log(`[rtdn-webhook] Unhandled notificationType: ${notificationType}`);
+        }
+    } catch (err) {
+        console.error('[rtdn-webhook] Error processing notification:', err);
+    }
+});
+
+// ── RTDN helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Re-verify with Google Play and extend the subscription endDate in Firestore.
+ */
+async function _handleRenewal(subscriptionId, purchaseToken) {
+    let purchase;
+    try {
+        purchase = await verifySubscriptionPurchase(subscriptionId, purchaseToken);
+    } catch (err) {
+        console.warn('[rtdn-webhook] Renewal verification failed:', err.message);
+        return;
+    }
+
+    const newEndDate = purchase.expiryTimeMillis
+        ? new Date(parseInt(purchase.expiryTimeMillis, 10))
+        : null;
+
+    // Find matching subscription document(s) by purchaseToken
+    const snap = await db
+        .collection('subscriptions')
+        .where('purchaseToken', '==', purchaseToken)
+        .get();
+
+    if (snap.empty) {
+        console.warn('[rtdn-webhook] No Firestore subscription found for token (renewal)');
+        return;
+    }
+
+    const batch = db.batch();
+    snap.docs.forEach((doc) => {
+        batch.update(doc.ref, {
+            status: 'active',
+            ...(newEndDate ? { endDate: newEndDate } : {}),
+            updatedAt: new Date(),
+        });
+
+        // Update the parent garage doc too
+        const garageId = doc.data().garageId;
+        if (garageId) {
+            batch.update(db.collection('garages').doc(garageId), {
+                'subscription.status': 'active',
+                ...(newEndDate ? { 'subscription.endDate': newEndDate } : {}),
+            });
+        }
+    });
+    await batch.commit();
+    console.log('[rtdn-webhook] Renewal synced to Firestore');
+}
+
+/**
+ * Mark subscription as canceled/expired in Firestore.
+ */
+async function _handleCancellation(subscriptionId, purchaseToken, notificationType) {
+    const status = notificationType === 6 ? 'grace_period' : 'canceled';
+
+    const snap = await db
+        .collection('subscriptions')
+        .where('purchaseToken', '==', purchaseToken)
+        .get();
+
+    if (snap.empty) {
+        console.warn('[rtdn-webhook] No Firestore subscription found for token (cancellation)');
+        return;
+    }
+
+    const batch = db.batch();
+    snap.docs.forEach((doc) => {
+        batch.update(doc.ref, { status, updatedAt: new Date() });
+
+        const garageId = doc.data().garageId;
+        if (garageId) {
+            batch.update(db.collection('garages').doc(garageId), {
+                'subscription.status': status,
+            });
+        }
+    });
+    await batch.commit();
+    console.log(`[rtdn-webhook] Subscription status set to '${status}' in Firestore`);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _calcEndDate(from, duration) {
     const d = new Date(from);

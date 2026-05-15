@@ -1,18 +1,17 @@
 # GarageHub Payment Server
 
-Express.js backend for handling **Razorpay payments and subscriptions** for the GarageHub application. Deployable to Vercel in one command.
+Express.js backend for handling **Google Play in-app purchases and subscriptions** for the GarageHub application. Deployable to Vercel in one command.
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/` | Health check |
-| `GET` | `/api/plans` | List all active subscription plans |
-| `GET` | `/api/plans/:planId` | Get a specific plan |
-| `POST` | `/api/payments/create-order` | Create Razorpay order |
-| `POST` | `/api/payments/verify` | Verify payment & activate subscription |
-| `POST` | `/api/payments/webhook` | Razorpay webhook receiver |
-| `GET` | `/api/payments/subscription/:garageId` | Get active subscription for a garage |
+| `GET`  | `/` | Health check |
+| `GET`  | `/api/plans` | List all active subscription plans |
+| `GET`  | `/api/plans/:planId` | Get a specific plan |
+| `POST` | `/api/payments/verify` | Verify Google Play purchase & activate subscription |
+| `POST` | `/api/payments/rtdn-webhook` | Google RTDN Pub/Sub webhook (auto-renewals / cancellations) |
+| `GET`  | `/api/payments/subscription/:garageId` | Get active subscription for a garage |
 
 ---
 
@@ -24,12 +23,23 @@ npm install
 ```
 
 ### 2. Configure environment
-```bash
-cp .env.example .env
-```
-Edit `.env` and fill in your Razorpay and Firebase credentials.
 
-Optionally, for local Firebase access, copy `serviceAccountKey.json` from the admin panel into the `backend/` directory.
+Create a `.env` file in the `backend/` directory with these variables:
+
+```env
+# Firebase Admin SDK
+FIREBASE_PROJECT_ID=your-firebase-project-id
+FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@your-project.iam.gserviceaccount.com
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+# Google Play Developer API
+# Paste the entire service-account JSON key file content as a single JSON string
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}
+GOOGLE_PLAY_PACKAGE_NAME=com.aieras.garageinvoice.app
+
+# CORS (comma-separated or *)
+ALLOWED_ORIGINS=*
+```
 
 ### 3. Start the server
 ```bash
@@ -58,70 +68,81 @@ Go to **Vercel Project → Settings → Environment Variables** and add:
 
 | Variable | Description |
 |----------|-------------|
-| `RAZORPAY_KEY_ID` | Your Razorpay Key ID (`rzp_live_...` or `rzp_test_...`) |
-| `RAZORPAY_KEY_SECRET` | Your Razorpay Key Secret |
-| `RAZORPAY_WEBHOOK_SECRET` | Webhook secret from Razorpay Dashboard |
-| `FIREBASE_PROJECT_ID` | `garagehub-4a484` |
-| `FIREBASE_CLIENT_EMAIL` | Service account email |
+| `FIREBASE_PROJECT_ID` | Firebase project ID |
+| `FIREBASE_CLIENT_EMAIL` | Firebase service account email |
 | `FIREBASE_PRIVATE_KEY` | Full private key (with `\n` for newlines) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full Play Console service-account JSON (stringified) |
+| `GOOGLE_PLAY_PACKAGE_NAME` | `com.aieras.garageinvoice.app` |
 | `ALLOWED_ORIGINS` | Comma-separated allowed CORS origins |
 
-> **Important for `FIREBASE_PRIVATE_KEY`**: Paste the full PEM key including `-----BEGIN PRIVATE KEY-----` header and footer. Vercel handles multi-line strings correctly.
+> **`GOOGLE_SERVICE_ACCOUNT_JSON`**: In Vercel, paste the entire JSON key file as a single-line string (use `JSON.stringify` or `jq -c . key.json` to collapse it).
 
-### 4. Configure Razorpay Webhook
+---
 
-In Razorpay Dashboard → **Webhooks → Add Webhook**:
-- URL: `https://your-vercel-domain.vercel.app/api/payments/webhook`
-- Secret: same as `RAZORPAY_WEBHOOK_SECRET`
-- Events: `payment.captured`, `payment.failed`
+## Google Play Setup
+
+### Service Account (for purchase verification)
+1. Go to **Play Console → Users and permissions → Invite new users**.
+2. Add your Google Cloud service account email.
+3. Grant: **"View financial data, orders, and cancellation survey responses"**.
+4. Download the JSON key from **Google Cloud Console → IAM → Service Accounts**.
+5. Paste the key content into `GOOGLE_SERVICE_ACCOUNT_JSON`.
+
+### RTDN Webhook (for auto-renewals / cancellations)
+1. Create a **Pub/Sub topic** in Google Cloud Console.
+2. Go to **Play Console → Monetization → Real-Time Developer Notifications**.
+3. Set the topic ARN.
+4. Create a **push subscription** pointing to:
+   ```
+   https://<your-vercel-domain>/api/payments/rtdn-webhook
+   ```
+5. Grant Pub/Sub SA the `pubsub.topics.publish` permission on the topic.
+
+### Supported RTDN Notification Types
+
+| Type | Action |
+|------|--------|
+| `SUBSCRIPTION_RENEWED` (2) | Extend endDate, set status → `active` |
+| `SUBSCRIPTION_RECOVERED` (1) | Same as renewed |
+| `SUBSCRIPTION_RESTARTED` (7) | Same as renewed |
+| `SUBSCRIPTION_CANCELED` (3) | Set status → `canceled` |
+| `SUBSCRIPTION_EXPIRED` (12) | Set status → `canceled` |
+| `SUBSCRIPTION_REVOKED` (13) | Set status → `canceled` |
+| `SUBSCRIPTION_ON_HOLD` (5) | Set status → `canceled` |
+| `SUBSCRIPTION_IN_GRACE_PERIOD` (6) | Set status → `grace_period` |
 
 ---
 
 ## Flutter Integration Flow
 
 ```
-Flutter App                    Payment Server                Razorpay
+Flutter App                    Payment Server              Google Play API
     │                                │                          │
-    ├─ POST /api/payments/create-order ──────────────────────────►
-    │                                │ Creates Razorpay Order   │
-    │◄── { orderId, amount, keyId } ──┤                          │
-    │                                                            │
-    │  Opens Razorpay checkout (flutter_razorpay)                │
-    │◄─────────────── Payment success callback ──────────────────┤
-    │  { razorpay_payment_id, razorpay_order_id, razorpay_signature }
-    │                                │
-    ├─ POST /api/payments/verify ────►
-    │                                │ Verifies HMAC signature
-    │                                │ Writes subscription to Firestore
-    │◄── { success, subscriptionId } ┤
-```
+    │   User taps Subscribe          │                          │
+    ├─ in_app_purchase.buyNonConsumable() ──────────────────────►
+    │                                │  Play billing dialog     │
+    │◄── PurchaseStatus.purchased ───┤                          │
+    │    (purchaseToken available)   │                          │
+    │                                │                          │
+    ├─ POST /api/payments/verify ────►                          │
+    │  { purchaseToken, productId,   │                          │
+    │    garageId, planId, ... }     │                          │
+    │                                ├─ purchases.subscriptions.get() ─►
+    │                                │◄── SubscriptionPurchase ─┤
+    │                                │  (validates token)       │
+    │                                │                          │
+    │                                │ Write Firestore          │
+    │                                ├─ purchases.acknowledge() ─►
+    │◄── { success, subscriptionId } ┤                          │
+    │  Snackbar: "Subscribed!"       │                          │
 
-## Request/Response Examples
 
-### Create Order
-```json
-POST /api/payments/create-order
-{
-  "planId": "abc123",
-  "garageId": "garage_uid_456",
-  "amount": 49900,
-  "planName": "Pro",
-  "duration": "monthly"
-}
-```
-> Note: `amount` is in **paise** (₹499 = 49900 paise)
-
-### Verify Payment
-```json
-POST /api/payments/verify
-{
-  "razorpay_order_id": "order_xxx",
-  "razorpay_payment_id": "pay_xxx",
-  "razorpay_signature": "sig_xxx",
-  "garageId": "garage_uid_456",
-  "planId": "abc123",
-  "planName": "Pro",
-  "duration": "monthly",
-  "price": 499
-}
+Google RTDN Pub/Sub            Payment Server              Firestore
+    │                                │                          │
+    ├─ POST /api/payments/rtdn-webhook►                         │
+    │  { subscriptionNotification }  │                          │
+    │                                │ Decode & verify          │
+    │◄── 200 OK ─────────────────────┤                          │
+    │                                ├─ Update subscription ────►
+    │                                │  status / endDate        │
 ```

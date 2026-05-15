@@ -34,7 +34,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ── Routes ─────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) =>
-    res.json({ service: 'GarageHub Payment Server', status: 'ok', version: '1.0.0' })
+    res.json({ service: 'GarageHub Payment Server', status: 'ok', version: '1.1.0' })
 );
 
 app.use('/api/payments', paymentsRouter);
