@@ -14,10 +14,11 @@ const {
 /**
  * Body: {
  *   purchaseId, purchaseToken, productId, serverVerificationData,
- *   source, garageId, planId, planName, duration, price
+ *   source, garageId, planId, planName, price
  * }
  *
- * Verifies a Google Play subscription purchase and activates it in Firestore.
+ * Verifies a Google Play subscription (subscriptionsv2) and activates it.
+ * basePlanId and expiryDate are extracted directly from Google's response.
  */
 router.post('/verify', async (req, res) => {
     try {
@@ -29,75 +30,96 @@ router.post('/verify', async (req, res) => {
             garageId,
             planId,
             planName,
-            duration,
             price,
         } = req.body;
 
         // ── Basic input validation ────────────────────────────────────────────
-        if (!garageId || !planId) {
-            return res.status(400).json({ error: 'garageId and planId are required.' });
+        if (!garageId) {
+            return res.status(400).json({ error: 'garageId is required.' });
         }
-        if (!purchaseToken || !productId) {
-            return res.status(400).json({ error: 'purchaseToken and productId are required.' });
+        if (!purchaseToken) {
+            return res.status(400).json({ error: 'purchaseToken is required.' });
         }
 
-        // ── Google Play verification ──────────────────────────────────────────
-        // For Google Play, the serverVerificationData IS the purchaseToken.
-        // We only call the real API when source is 'play_store'.
+        // ── Google Play verification (subscriptionsv2) ────────────────────────
+        let googleData = null;
         if (source === 'play_store') {
-            await verifySubscriptionPurchase(productId, purchaseToken);
-            // Throws if the token is invalid, expired, or payment is pending.
+            // verifySubscriptionPurchase now only needs the token.
+            // It returns { subscriptionId, basePlanId, expiryDate, active, autoRenew, acknowledgementState }
+            googleData = await verifySubscriptionPurchase(purchaseToken);
+            // Throws if the token is invalid, inactive, or expired.
         }
-        // Apple / other sources can be added here in the future.
+
+        // ── Resolve subscription metadata ─────────────────────────────────────
+        // For play_store, trust Google's data. For other sources, use what was sent.
+        const subscriptionId = googleData?.subscriptionId || productId || '';
+        const basePlanId = googleData?.basePlanId || '';
+        const expiryDate = googleData?.expiryDate
+            ? new Date(googleData.expiryDate)
+            : null;
+        const autoRenew = googleData?.autoRenew ?? false;
+        const subscriptionState = googleData?.subscriptionState || '';
+        const acknowledgementState = googleData?.acknowledgementState || '';
 
         // ── Persist subscription ──────────────────────────────────────────────
         const now = new Date();
-        const endDate = _calcEndDate(now, duration);
 
         const subData = {
             garageId,
-            planId,
+            planId: planId || subscriptionId,
             planName: planName || '',
             price: price || 0,
-            duration: duration || '',
+            subscriptionId,
+            basePlanId,
             purchaseId: purchaseId || '',
             purchaseToken: purchaseToken || '',
-            productId: productId || '',
+            productId: productId || subscriptionId,
             source: source || 'unknown',
             startDate: now,
-            endDate,
+            expiryDate,
+            autoRenew,
+            subscriptionState,
+            acknowledgementState,
             status: 'active',
             createdAt: now,
         };
 
         const subRef = await db.collection('subscriptions').add(subData);
 
+        // Update the garage's embedded subscription summary
         await db.collection('garages').doc(garageId).update({
             subscription: {
-                planId,
+                planId: planId || subscriptionId,
                 planName: planName || '',
+                subscriptionId,
+                basePlanId,
                 startDate: now,
-                endDate,
+                expiryDate,
+                autoRenew,
                 status: 'active',
             },
         });
 
         // ── Acknowledge so Google doesn't auto-refund after 3 days ───────────
         if (source === 'play_store') {
-            await acknowledgeSubscriptionPurchase(productId, purchaseToken);
+            if (acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') {
+                await acknowledgeSubscriptionPurchase(purchaseToken);
+            }
         }
 
         return res.json({
             success: true,
             subscriptionId: subRef.id,
-            message: 'In-app purchase verified and subscription activated successfully.',
+            basePlanId,
+            expiryDate: expiryDate?.toISOString() || null,
+            message: 'Subscription verified and activated successfully.',
         });
     } catch (err) {
         console.error('[verify]', err);
-        // Surface clear error for invalid purchase tokens
         const msg =
-            err.message?.includes('invalid') || err.message?.includes('expired')
-                ? 'Invalid or expired purchase token.'
+            err.message?.includes('invalid') || err.message?.includes('expired') ||
+                err.message?.includes('not active') || err.message?.includes('No subscription')
+                ? err.message
                 : err.message || 'Verification failed.';
         return res.status(400).json({ error: msg });
     }
@@ -126,8 +148,11 @@ router.get('/subscription/:garageId', async (req, res) => {
 
         const doc = snap.docs[0];
         const data = doc.data();
-        const endDate = data.endDate?.toDate ? data.endDate.toDate() : new Date(data.endDate);
-        const isExpired = endDate < new Date();
+
+        // Resolve expiryDate from either the new field or the legacy endDate
+        const expiryRaw = data.expiryDate ?? data.endDate;
+        const expiryDate = expiryRaw?.toDate ? expiryRaw.toDate() : new Date(expiryRaw);
+        const isExpired = expiryDate < new Date();
 
         if (isExpired) {
             await doc.ref.update({ status: 'expired' });
@@ -140,7 +165,11 @@ router.get('/subscription/:garageId', async (req, res) => {
                 id: doc.id,
                 ...data,
                 startDate: data.startDate?.toDate?.() || data.startDate,
-                endDate,
+                expiryDate,
+                // expose basePlanId so the app knows monthly vs yearly
+                basePlanId: data.basePlanId || '',
+                subscriptionId: data.subscriptionId || '',
+                autoRenew: data.autoRenew ?? false,
             },
         });
     } catch (err) {
@@ -192,9 +221,9 @@ router.post('/rtdn-webhook', async (req, res) => {
             return;
         }
 
-        const { notificationType, purchaseToken, subscriptionId } = subNotification;
+        const { notificationType, purchaseToken } = subNotification;
 
-        console.log(`[rtdn-webhook] type=${notificationType} subscriptionId=${subscriptionId}`);
+        console.log(`[rtdn-webhook] type=${notificationType}`);
 
         // Notification type reference:
         // 1  SUBSCRIPTION_RECOVERED        – recovered from account hold
@@ -211,7 +240,7 @@ router.post('/rtdn-webhook', async (req, res) => {
             case 1: // RECOVERED
             case 2: // RENEWED
             case 7: // RESTARTED
-                await _handleRenewal(subscriptionId, purchaseToken);
+                await _handleRenewal(purchaseToken);
                 break;
 
             case 3:  // CANCELED
@@ -219,7 +248,7 @@ router.post('/rtdn-webhook', async (req, res) => {
             case 6:  // GRACE_PERIOD (still usable – mark as grace_period)
             case 12: // EXPIRED
             case 13: // REVOKED
-                await _handleCancellation(subscriptionId, purchaseToken, notificationType);
+                await _handleCancellation(purchaseToken, notificationType);
                 break;
 
             default:
@@ -233,20 +262,19 @@ router.post('/rtdn-webhook', async (req, res) => {
 // ── RTDN helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Re-verify with Google Play and extend the subscription endDate in Firestore.
+ * Re-verify with Google Play (subscriptionsv2) and extend the subscription
+ * expiryDate in Firestore.
  */
-async function _handleRenewal(subscriptionId, purchaseToken) {
-    let purchase;
+async function _handleRenewal(purchaseToken) {
+    let googleData;
     try {
-        purchase = await verifySubscriptionPurchase(subscriptionId, purchaseToken);
+        googleData = await verifySubscriptionPurchase(purchaseToken);
     } catch (err) {
         console.warn('[rtdn-webhook] Renewal verification failed:', err.message);
         return;
     }
 
-    const newEndDate = purchase.expiryTimeMillis
-        ? new Date(parseInt(purchase.expiryTimeMillis, 10))
-        : null;
+    const newExpiryDate = googleData.expiryDate ? new Date(googleData.expiryDate) : null;
 
     // Find matching subscription document(s) by purchaseToken
     const snap = await db
@@ -263,7 +291,10 @@ async function _handleRenewal(subscriptionId, purchaseToken) {
     snap.docs.forEach((doc) => {
         batch.update(doc.ref, {
             status: 'active',
-            ...(newEndDate ? { endDate: newEndDate } : {}),
+            basePlanId: googleData.basePlanId || doc.data().basePlanId || '',
+            autoRenew: googleData.autoRenew ?? true,
+            subscriptionState: googleData.subscriptionState || '',
+            ...(newExpiryDate ? { expiryDate: newExpiryDate } : {}),
             updatedAt: new Date(),
         });
 
@@ -272,7 +303,8 @@ async function _handleRenewal(subscriptionId, purchaseToken) {
         if (garageId) {
             batch.update(db.collection('garages').doc(garageId), {
                 'subscription.status': 'active',
-                ...(newEndDate ? { 'subscription.endDate': newEndDate } : {}),
+                'subscription.autoRenew': googleData.autoRenew ?? true,
+                ...(newExpiryDate ? { 'subscription.expiryDate': newExpiryDate } : {}),
             });
         }
     });
@@ -283,7 +315,7 @@ async function _handleRenewal(subscriptionId, purchaseToken) {
 /**
  * Mark subscription as canceled/expired in Firestore.
  */
-async function _handleCancellation(subscriptionId, purchaseToken, notificationType) {
+async function _handleCancellation(purchaseToken, notificationType) {
     const status = notificationType === 6 ? 'grace_period' : 'canceled';
 
     const snap = await db
@@ -309,27 +341,6 @@ async function _handleCancellation(subscriptionId, purchaseToken, notificationTy
     });
     await batch.commit();
     console.log(`[rtdn-webhook] Subscription status set to '${status}' in Firestore`);
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function _calcEndDate(from, duration) {
-    const d = new Date(from);
-    switch (duration) {
-        case 'monthly':
-            d.setMonth(d.getMonth() + 1);
-            break;
-        case 'quarterly':
-            d.setMonth(d.getMonth() + 3);
-            break;
-        case 'yearly':
-            d.setFullYear(d.getFullYear() + 1);
-            break;
-        default:
-            // lifetime
-            d.setFullYear(d.getFullYear() + 100);
-    }
-    return d;
 }
 
 module.exports = router;
