@@ -31,6 +31,8 @@ router.post('/verify', async (req, res) => {
             planId,
             planName,
             price,
+            duration,
+            basePlanId,
         } = req.body;
 
         // ── Basic input validation ────────────────────────────────────────────
@@ -53,13 +55,41 @@ router.post('/verify', async (req, res) => {
         // ── Resolve subscription metadata ─────────────────────────────────────
         // For play_store, trust Google's data. For other sources, use what was sent.
         const subscriptionId = googleData?.subscriptionId || productId || '';
-        const basePlanId = googleData?.basePlanId || '';
-        const expiryDate = googleData?.expiryDate
-            ? new Date(googleData.expiryDate)
-            : null;
-        const autoRenew = googleData?.autoRenew ?? false;
+        const resolvedBasePlanId = googleData?.basePlanId || basePlanId || '';
+        const offerId = googleData?.offerId || null;
+
+        let expiryDate = null;
+        if (googleData?.expiryDate) {
+            expiryDate = new Date(googleData.expiryDate);
+        } else {
+            const d = new Date();
+            const dur = (duration || '').toLowerCase();
+            if (dur.includes('month')) {
+                d.setMonth(d.getMonth() + 1);
+                expiryDate = d;
+            } else if (dur.includes('quarter')) {
+                d.setMonth(d.getMonth() + 3);
+                expiryDate = d;
+            } else if (dur.includes('year')) {
+                d.setFullYear(d.getFullYear() + 1);
+                expiryDate = d;
+            } else if (dur.includes('lifetime')) {
+                d.setFullYear(d.getFullYear() + 100);
+                expiryDate = d;
+            } else {
+                // Default fallback: 1 month
+                d.setMonth(d.getMonth() + 1);
+                expiryDate = d;
+            }
+        }
+
+        const resolvedAutoRenew = googleData?.autoRenew ?? (req.body.autoRenew !== undefined ? !!req.body.autoRenew : true);
         const subscriptionState = googleData?.subscriptionState || '';
         const acknowledgementState = googleData?.acknowledgementState || '';
+        const isInTrial = googleData?.isInTrial ?? false;
+        const trialEndDate = googleData?.trialEndDate
+            ? new Date(googleData.trialEndDate)
+            : null;
 
         // ── Persist subscription ──────────────────────────────────────────────
         const now = new Date();
@@ -70,16 +100,19 @@ router.post('/verify', async (req, res) => {
             planName: planName || '',
             price: price || 0,
             subscriptionId,
-            basePlanId,
+            basePlanId: resolvedBasePlanId,
+            offerId,
             purchaseId: purchaseId || '',
             purchaseToken: purchaseToken || '',
             productId: productId || subscriptionId,
             source: source || 'unknown',
             startDate: now,
             expiryDate,
-            autoRenew,
+            autoRenew: resolvedAutoRenew,
             subscriptionState,
             acknowledgementState,
+            isInTrial,
+            trialEndDate,
             status: 'active',
             createdAt: now,
         };
@@ -92,10 +125,13 @@ router.post('/verify', async (req, res) => {
                 planId: planId || subscriptionId,
                 planName: planName || '',
                 subscriptionId,
-                basePlanId,
+                basePlanId: resolvedBasePlanId,
+                offerId,
                 startDate: now,
                 expiryDate,
-                autoRenew,
+                autoRenew: resolvedAutoRenew,
+                isInTrial,
+                trialEndDate,
                 status: 'active',
             },
         });
@@ -110,9 +146,14 @@ router.post('/verify', async (req, res) => {
         return res.json({
             success: true,
             subscriptionId: subRef.id,
-            basePlanId,
+            basePlanId: resolvedBasePlanId,
+            offerId,
             expiryDate: expiryDate?.toISOString() || null,
-            message: 'Subscription verified and activated successfully.',
+            isInTrial,
+            trialEndDate: trialEndDate?.toISOString() || null,
+            message: isInTrial
+                ? 'Free trial activated! Enjoy 7 days on us.'
+                : 'Subscription verified and activated successfully.',
         });
     } catch (err) {
         console.error('[verify]', err);

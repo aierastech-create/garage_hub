@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { adminAuth } = require('../lib/firebase');
+const { admin, db, adminAuth } = require('../lib/firebase');
 
 /**
  * Middleware: verify the request carries a valid Firebase ID token
@@ -119,6 +119,185 @@ router.get('/user/:uid', requireAdminToken, async (req, res) => {
     } catch (err) {
         console.error('[get-user]', err);
         return res.status(500).json({ error: err.message || 'Failed to fetch user.' });
+    }
+});
+
+/**
+ * Helper: check if subscription is currently active or in grace period
+ */
+function isSubscriptionActive(subscription) {
+    if (!subscription) return false;
+
+    const status = subscription.status;
+    if (status !== 'active' && status !== 'grace_period') {
+        return false;
+    }
+
+    if (subscription.expiryDate) {
+        let expiryDate;
+        if (subscription.expiryDate.toDate) {
+            expiryDate = subscription.expiryDate.toDate();
+        } else {
+            expiryDate = new Date(subscription.expiryDate);
+        }
+
+        if (expiryDate < new Date()) {
+            return false; // Expired
+        }
+    }
+
+    return true; // Active
+}
+
+/**
+ * GET /api/admin/inactive-plan-users
+ * Returns a list of garages whose subscriptions are not active.
+ */
+router.get('/inactive-plan-users', requireAdminToken, async (req, res) => {
+    try {
+        const snap = await db.collection('garages').get();
+        const inactiveGarages = [];
+
+        snap.forEach((doc) => {
+            const data = doc.data();
+            const subscription = data.subscription;
+            
+            if (!isSubscriptionActive(subscription)) {
+                inactiveGarages.push({
+                    id: doc.id,
+                    garageName: data.garageName || 'Unnamed Garage',
+                    ownerName: data.ownerName || '—',
+                    email: data.email || '—',
+                    phone: data.phone || '—',
+                    hasFcmToken: !!data.fcmToken,
+                    fcmToken: data.fcmToken || null,
+                    subscription: subscription ? {
+                        status: subscription.status || 'inactive',
+                        planName: subscription.planName || 'N/A',
+                        expiryDate: subscription.expiryDate
+                            ? (subscription.expiryDate.toDate ? subscription.expiryDate.toDate().toISOString() : new Date(subscription.expiryDate).toISOString())
+                            : null
+                    } : null
+                });
+            }
+        });
+
+        return res.json({
+            success: true,
+            count: inactiveGarages.length,
+            garages: inactiveGarages
+        });
+    } catch (err) {
+        console.error('[get-inactive-plan-users]', err);
+        return res.status(500).json({ error: err.message || 'Failed to fetch inactive users.' });
+    }
+});
+
+/**
+ * POST /api/admin/send-push-inactive-plans
+ * Body: { title, body }
+ * Sends a push notification to all garages with inactive subscriptions and registered FCM tokens.
+ */
+router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => {
+    try {
+        const { title, body } = req.body;
+
+        if (!title || !body) {
+            return res.status(400).json({ error: 'title and body are required.' });
+        }
+
+        const snap = await db.collection('garages').get();
+        const fcmTokens = [];
+        const targetedGarages = [];
+
+        snap.forEach((doc) => {
+            const data = doc.data();
+            const subscription = data.subscription;
+            
+            if (!isSubscriptionActive(subscription)) {
+                if (data.fcmToken) {
+                    fcmTokens.push(data.fcmToken);
+                    targetedGarages.push({
+                        id: doc.id,
+                        garageName: data.garageName || 'Unnamed Garage'
+                    });
+                }
+            }
+        });
+
+        if (fcmTokens.length === 0) {
+            return res.json({
+                success: true,
+                message: 'No inactive plan users have registered FCM tokens. No notifications were sent.',
+                successCount: 0,
+                failureCount: 0
+            });
+        }
+
+        // Chunk tokens into arrays of 500 (FCM multicast size limit)
+        const chunkArray = (arr, size) => {
+            const chunks = [];
+            for (let i = 0; i < arr.length; i += size) {
+                chunks.push(arr.slice(i, i + size));
+            }
+            return chunks;
+        };
+
+        const tokenChunks = chunkArray(fcmTokens, 500);
+        let successCount = 0;
+        let failureCount = 0;
+
+        for (const chunk of tokenChunks) {
+            const response = await admin.messaging().sendEachForMulticast({
+                tokens: chunk,
+                notification: {
+                    title,
+                    body,
+                },
+                data: {
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                    type: 'inactive_plan_reminder'
+                },
+                android: {
+                    notification: {
+                        sound: 'default',
+                        clickAction: 'FLUTTER_NOTIFICATION_CLICK'
+                    }
+                },
+                apns: {
+                    payload: {
+                        aps: {
+                            sound: 'default'
+                        }
+                    }
+                }
+            });
+
+            successCount += response.successCount;
+            failureCount += response.failureCount;
+
+            if (response.failureCount > 0) {
+                response.responses.forEach((resp, idx) => {
+                    if (!resp.success) {
+                        console.warn(`[send-push-inactive-plans] FCM failure for token ${chunk[idx]}:`, resp.error);
+                    }
+                });
+            }
+        }
+
+        console.log(`[send-push-inactive-plans] Multicast sent. success=${successCount} failure=${failureCount} by admin=${req.caller.uid}`);
+
+        return res.json({
+            success: true,
+            message: `Push notification dispatched. Success: ${successCount}, Failures: ${failureCount}`,
+            successCount,
+            failureCount,
+            targetedCount: targetedGarages.length
+        });
+
+    } catch (err) {
+        console.error('[send-push-inactive-plans]', err);
+        return res.status(500).json({ error: err.message || 'Failed to dispatch push notifications.' });
     }
 });
 
