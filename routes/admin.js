@@ -133,12 +133,13 @@ function isSubscriptionActive(subscription) {
         return false;
     }
 
-    if (subscription.expiryDate) {
+    const expiryRaw = subscription.expiryDate ?? subscription.endDate;
+    if (expiryRaw) {
         let expiryDate;
-        if (subscription.expiryDate.toDate) {
-            expiryDate = subscription.expiryDate.toDate();
+        if (expiryRaw.toDate) {
+            expiryDate = expiryRaw.toDate();
         } else {
-            expiryDate = new Date(subscription.expiryDate);
+            expiryDate = new Date(expiryRaw);
         }
 
         if (expiryDate < new Date()) {
@@ -278,7 +279,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
             successCount += response.successCount;
             failureCount += response.failureCount;
 
-            if (response.failureCount > 0) {
+             if (response.failureCount > 0) {
                 const batch = db.batch();
                 let hasUpdates = false;
 
@@ -286,9 +287,9 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
                     if (!resp.success) {
                         const token = chunk[idx];
                         const garageId = tokenToGarageId[token];
-                        console.warn(`[send-push-inactive-plans] FCM failure for token ${token}:`, resp.error);
+                        const errorCode = resp.error?.code || resp.error?.errorInfo?.code;
+                        console.warn(`[send-push-inactive-plans] FCM failure for token ${token} (errorCode: ${errorCode}):`, resp.error);
 
-                        const errorCode = resp.error?.code;
                         if (
                             errorCode === 'messaging/registration-token-not-registered' ||
                             errorCode === 'messaging/invalid-argument'
@@ -298,6 +299,8 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
                                 const docRef = db.collection('garages').doc(garageId);
                                 batch.update(docRef, { fcmToken: admin.firestore.FieldValue.delete() });
                                 hasUpdates = true;
+                            } else {
+                                console.warn(`[send-push-inactive-plans] Warning: Token failed but no garageId was mapped for token: ${token}`);
                             }
                         }
                     }
