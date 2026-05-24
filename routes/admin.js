@@ -208,6 +208,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
 
         const snap = await db.collection('garages').get();
         const fcmTokens = [];
+        const tokenToGarageId = {};
         const targetedGarages = [];
 
         snap.forEach((doc) => {
@@ -217,6 +218,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
             if (!isSubscriptionActive(subscription)) {
                 if (data.fcmToken) {
                     fcmTokens.push(data.fcmToken);
+                    tokenToGarageId[data.fcmToken] = doc.id;
                     targetedGarages.push({
                         id: doc.id,
                         garageName: data.garageName || 'Unnamed Garage'
@@ -277,11 +279,34 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
             failureCount += response.failureCount;
 
             if (response.failureCount > 0) {
+                const batch = db.batch();
+                let hasUpdates = false;
+
                 response.responses.forEach((resp, idx) => {
                     if (!resp.success) {
-                        console.warn(`[send-push-inactive-plans] FCM failure for token ${chunk[idx]}:`, resp.error);
+                        const token = chunk[idx];
+                        const garageId = tokenToGarageId[token];
+                        console.warn(`[send-push-inactive-plans] FCM failure for token ${token}:`, resp.error);
+
+                        const errorCode = resp.error?.code;
+                        if (
+                            errorCode === 'messaging/registration-token-not-registered' ||
+                            errorCode === 'messaging/invalid-argument'
+                        ) {
+                            if (garageId) {
+                                console.log(`[send-push-inactive-plans] Queueing removal of invalid/unregistered FCM token for garage: ${garageId}`);
+                                const docRef = db.collection('garages').doc(garageId);
+                                batch.update(docRef, { fcmToken: admin.firestore.FieldValue.delete() });
+                                hasUpdates = true;
+                            }
+                        }
                     }
                 });
+
+                if (hasUpdates) {
+                    await batch.commit();
+                    console.log('[send-push-inactive-plans] Stale/invalid FCM tokens successfully removed from Firestore');
+                }
             }
         }
 
