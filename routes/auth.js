@@ -33,7 +33,7 @@ async function sendOtpEmail(email, otp) {
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Verify Your GarageHub Account</title>
+        <title>Verify Your Garage Invoice Account</title>
         <style>
             body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -105,11 +105,11 @@ async function sendOtpEmail(email, otp) {
     <body>
         <div class="email-container">
             <div class="header">
-                <h1>GarageHub</h1>
+                <h1>Garage Invoice</h1>
             </div>
             <div class="content">
                 <p>Hello,</p>
-                <p>Thank you for choosing GarageHub. To complete your email verification, please use the following One-Time Password (OTP):</p>
+                <p>Thank you for choosing Garage Invoice. To complete your email verification, please use the following One-Time Password (OTP):</p>
                 
                 <div class="otp-container">
                     <div class="otp-code">${otp}</div>
@@ -117,10 +117,10 @@ async function sendOtpEmail(email, otp) {
                 </div>
                 
                 <p>If you did not request this code, you can safely ignore this email.</p>
-                <p>Best regards,<br>The GarageHub Team</p>
+                <p>Best regards,<br>The Garage Invoice Team</p>
             </div>
             <div class="footer">
-                &copy; 2026 GarageHub. All rights reserved.
+                &copy; 2026 Garage Invoice. All rights reserved.
             </div>
         </div>
     </body>
@@ -128,9 +128,9 @@ async function sendOtpEmail(email, otp) {
     `;
 
     await transporter.sendMail({
-        from: `"GarageHub Support" <${from}>`,
+        from: `"Garage Invoice Support" <${from}>`,
         to: email,
-        subject: 'Verify Your GarageHub Account - OTP',
+        subject: 'Verify Your Garage Invoice Account - OTP',
         html: htmlContent
     });
 }
