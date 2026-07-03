@@ -162,7 +162,7 @@ router.get('/inactive-plan-users', requireAdminToken, async (req, res) => {
         snap.forEach((doc) => {
             const data = doc.data();
             const subscription = data.subscription;
-            
+
             if (!isSubscriptionActive(subscription)) {
                 inactiveGarages.push({
                     id: doc.id,
@@ -196,12 +196,12 @@ router.get('/inactive-plan-users', requireAdminToken, async (req, res) => {
 
 /**
  * POST /api/admin/send-push-inactive-plans
- * Body: { title, body }
+ * Body: { title, body, type }
  * Sends a push notification to all garages with inactive subscriptions and registered FCM tokens.
  */
 router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => {
     try {
-        const { title, body } = req.body;
+        const { title, body, type = 'promotion' } = req.body;
 
         if (!title || !body) {
             return res.status(400).json({ error: 'title and body are required.' });
@@ -215,7 +215,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
         snap.forEach((doc) => {
             const data = doc.data();
             const subscription = data.subscription;
-            
+
             if (!isSubscriptionActive(subscription)) {
                 if (data.fcmToken) {
                     fcmTokens.push(data.fcmToken);
@@ -259,7 +259,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
                 },
                 data: {
                     click_action: 'FLUTTER_NOTIFICATION_CLICK',
-                    type: 'inactive_plan_reminder'
+                    type: type
                 },
                 android: {
                     notification: {
@@ -279,7 +279,7 @@ router.post('/send-push-inactive-plans', requireAdminToken, async (req, res) => 
             successCount += response.successCount;
             failureCount += response.failureCount;
 
-             if (response.failureCount > 0) {
+            if (response.failureCount > 0) {
                 const batch = db.batch();
                 let hasUpdates = false;
 

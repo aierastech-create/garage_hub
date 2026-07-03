@@ -7,6 +7,9 @@ const { admin, db, adminAuth } = require('../lib/firebase');
  * Sends a premium-designed HTML email with the 6-digit OTP code.
  */
 async function sendOtpEmail(email, otp) {
+
+    console.log("SMTP_USER:", process.env.SMTP_USER);
+console.log("SMTP_PASSWORD exists:", !!process.env.SMTP_PASSWORD);
     const host = process.env.SMTP_HOST;
     const port = parseInt(process.env.SMTP_PORT || '587');
     const secure = process.env.SMTP_SECURE === 'true';
