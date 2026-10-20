@@ -6,6 +6,7 @@ const paymentsRouter = require('./routes/payments');
 const plansRouter = require('./routes/plans');
 const adminRouter = require('./routes/admin');
 const authRouter = require('./routes/auth');
+const staffRouter = require('./routes/staff');
 
 const app = express();
 
@@ -42,6 +43,7 @@ app.use('/api/payments', paymentsRouter);
 app.use('/api/plans', plansRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/auth', authRouter);
+app.use('/api/staff', staffRouter);
 
 // ── 404 & Error handlers ───────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Route not found.' }));
