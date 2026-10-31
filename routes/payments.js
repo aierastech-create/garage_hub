@@ -3,6 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../lib/firebase');
+const { resolveTier } = require('../lib/tiers');
 const {
     verifySubscriptionPurchase,
     acknowledgeSubscriptionPurchase,
@@ -57,6 +58,8 @@ router.post('/verify', async (req, res) => {
         const subscriptionId = googleData?.subscriptionId || productId || '';
         const resolvedBasePlanId = googleData?.basePlanId || basePlanId || '';
         const offerId = googleData?.offerId || null;
+        // The tier comes from the verified product, never from the request.
+        const tier = await resolveTier(subscriptionId);
 
         let expiryDate = null;
         if (googleData?.expiryDate) {
@@ -100,6 +103,7 @@ router.post('/verify', async (req, res) => {
             planName: planName || '',
             price: price || 0,
             subscriptionId,
+            tier,
             basePlanId: resolvedBasePlanId,
             offerId,
             purchaseId: purchaseId || '',
@@ -119,12 +123,28 @@ router.post('/verify', async (req, res) => {
 
         const subRef = await db.collection('subscriptions').add(subData);
 
+        // Upgrade / downgrade: Google replaced the old purchase with this one.
+        // Retire the old record so its later RTDN events are ignored.
+        if (googleData?.linkedPurchaseToken) {
+            const oldSnap = await db
+                .collection('subscriptions')
+                .where('purchaseToken', '==', googleData.linkedPurchaseToken)
+                .get();
+            const batch = db.batch();
+            oldSnap.docs.forEach((doc) =>
+                batch.update(doc.ref, { status: 'replaced', replacedBy: subRef.id, updatedAt: now })
+            );
+            if (!oldSnap.empty) await batch.commit();
+        }
+
         // Update the garage's embedded subscription summary
         await db.collection('garages').doc(garageId).update({
             subscription: {
                 planId: planId || subscriptionId,
                 planName: planName || '',
                 subscriptionId,
+                tier,
+                purchaseToken,
                 basePlanId: resolvedBasePlanId,
                 offerId,
                 startDate: now,
@@ -303,6 +323,17 @@ router.post('/rtdn-webhook', async (req, res) => {
 // ── RTDN helpers ─────────────────────────────────────────────────────────────
 
 /**
+ * True when the garage's embedded summary belongs to [purchaseToken]. After an
+ * upgrade the garage tracks the new purchase, so events for the replaced one
+ * must not touch it. Summaries written before tokens were stored match any.
+ */
+async function _garageTracksToken(garageId, purchaseToken) {
+    const snap = await db.collection('garages').doc(garageId).get();
+    const tracked = snap.data()?.subscription?.purchaseToken;
+    return !tracked || tracked === purchaseToken;
+}
+
+/**
  * Re-verify with Google Play (subscriptionsv2) and extend the subscription
  * expiryDate in Firestore.
  */
@@ -329,7 +360,8 @@ async function _handleRenewal(purchaseToken) {
     }
 
     const batch = db.batch();
-    snap.docs.forEach((doc) => {
+    for (const doc of snap.docs) {
+        if (doc.data().status === 'replaced') continue;
         batch.update(doc.ref, {
             status: 'active',
             basePlanId: googleData.basePlanId || doc.data().basePlanId || '',
@@ -341,14 +373,14 @@ async function _handleRenewal(purchaseToken) {
 
         // Update the parent garage doc too
         const garageId = doc.data().garageId;
-        if (garageId) {
+        if (garageId && await _garageTracksToken(garageId, purchaseToken)) {
             batch.update(db.collection('garages').doc(garageId), {
                 'subscription.status': 'active',
                 'subscription.autoRenew': googleData.autoRenew ?? true,
                 ...(newExpiryDate ? { 'subscription.expiryDate': newExpiryDate } : {}),
             });
         }
-    });
+    }
     await batch.commit();
     console.log('[rtdn-webhook] Renewal synced to Firestore');
 }
@@ -370,16 +402,17 @@ async function _handleCancellation(purchaseToken, notificationType) {
     }
 
     const batch = db.batch();
-    snap.docs.forEach((doc) => {
+    for (const doc of snap.docs) {
+        if (doc.data().status === 'replaced') continue;
         batch.update(doc.ref, { status, updatedAt: new Date() });
 
         const garageId = doc.data().garageId;
-        if (garageId) {
+        if (garageId && await _garageTracksToken(garageId, purchaseToken)) {
             batch.update(db.collection('garages').doc(garageId), {
                 'subscription.status': status,
             });
         }
-    });
+    }
     await batch.commit();
     console.log(`[rtdn-webhook] Subscription status set to '${status}' in Firestore`);
 }

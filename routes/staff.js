@@ -1,22 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { admin, db, adminAuth } = require('../lib/firebase');
+const { featuresFor } = require('../lib/tiers');
 
 /**
- * Premium "Garage Staff" endpoints: employee accounts and job-card push
+ * "Garage Staff" endpoints (plans with the employees feature): employee accounts and job-card push
  * notifications. Employee accounts are regular Firebase Auth users carrying
  * the custom claims { role: 'employee', garageId } — firestore.rules uses
  * those claims to scope an employee to the job cards assigned to them.
  */
-
-// Same expiry rule the app uses (GarageUser.isSubscriptionActive).
-function isSubscriptionActive(subscription) {
-    if (!subscription || subscription.status !== 'active') return false;
-    const expiry = subscription.expiryDate;
-    if (!expiry) return false;
-    const expiryDate = typeof expiry.toDate === 'function' ? expiry.toDate() : new Date(expiry);
-    return expiryDate > new Date();
-}
 
 /** Verifies the Firebase ID token and attaches it as req.caller. */
 async function requireUser(req, res, next) {
@@ -35,8 +27,8 @@ async function requireUser(req, res, next) {
     }
 }
 
-/** Caller must be a garage owner with an active subscription. */
-async function requirePremiumOwner(req, res, next) {
+/** Caller must be a garage owner whose plan includes employees. */
+async function requireEmployeesOwner(req, res, next) {
     if (req.caller.role === 'employee' || req.caller.role === 'admin') {
         return res.status(403).json({ error: 'Only garage owners can manage staff.' });
     }
@@ -46,14 +38,16 @@ async function requirePremiumOwner(req, res, next) {
         if (!garageSnap.exists) {
             return res.status(403).json({ error: 'Garage not found for this account.' });
         }
-        if (!isSubscriptionActive(garageSnap.data().subscription)) {
-            return res.status(402).json({ error: 'This feature is available for premium subscribers only.' });
+        const features = await featuresFor(garageSnap.data().subscription);
+        if (!features.employees) {
+            return res.status(402).json({ error: 'Employees are not included in your current plan.' });
         }
 
         req.garage = { id: garageSnap.id, ...garageSnap.data() };
+        req.features = features;
         next();
     } catch (err) {
-        console.error('[staff/requirePremiumOwner]', err);
+        console.error('[staff/requireEmployeesOwner]', err);
         return res.status(500).json({ error: 'Failed to verify subscription.' });
     }
 }
@@ -87,7 +81,7 @@ const INBOX_TTL_MS = 24 * 24 * 60 * 60 * 1000; // matches AppNotification (24 da
  * Body: { name, email, phone, password }
  * Creates an employee login for the calling (premium) garage owner.
  */
-router.post('/employees', requireUser, requirePremiumOwner, async (req, res) => {
+router.post('/employees', requireUser, requireEmployeesOwner, async (req, res) => {
     try {
         const name = (req.body.name || '').trim();
         const email = (req.body.email || '').trim().toLowerCase();
@@ -99,6 +93,17 @@ router.post('/employees', requireUser, requirePremiumOwner, async (req, res) => 
         }
         if (password.length < 6) {
             return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+        }
+
+        // Checked before the login is created so no orphan account is left.
+        const countSnap = await db
+            .collection('garages').doc(req.garage.id)
+            .collection('employees').count().get();
+        const maxEmployees = Number(req.features.maxEmployees) || 0;
+        if (countSnap.data().count >= maxEmployees) {
+            return res.status(403).json({
+                error: `Your plan allows up to ${maxEmployees} employees. Remove one to add another.`,
+            });
         }
 
         let userRecord;
@@ -177,7 +182,7 @@ router.post('/employees/:employeeId/remove', requireUser, async (req, res) => {
  * POST /api/staff/employees/:employeeId/reset-password
  * Body: { password }
  */
-router.post('/employees/:employeeId/reset-password', requireUser, requirePremiumOwner, async (req, res) => {
+router.post('/employees/:employeeId/reset-password', requireUser, requireEmployeesOwner, async (req, res) => {
     try {
         const { employeeId } = req.params;
         const password = req.body.password || '';
