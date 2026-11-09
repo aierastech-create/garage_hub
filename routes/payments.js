@@ -159,7 +159,7 @@ router.post('/verify', async (req, res) => {
         // ── Acknowledge so Google doesn't auto-refund after 3 days ───────────
         if (source === 'play_store') {
             if (acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') {
-                await acknowledgeSubscriptionPurchase(purchaseToken);
+                await acknowledgeSubscriptionPurchase(subscriptionId, purchaseToken);
             }
         }
 
@@ -254,9 +254,9 @@ router.get('/subscription/:garageId', async (req, res) => {
  * Ref: https://developer.android.com/google/play/billing/rtdn-reference
  */
 router.post('/rtdn-webhook', async (req, res) => {
-    // Always respond 200 first; Pub/Sub re-delivers on non-2xx.
-    res.sendStatus(200);
-
+    // Process before responding: on Vercel the function is frozen as soon as
+    // the response is sent, so work done after res.send() never finishes.
+    // Pub/Sub re-delivers on non-2xx, so failures here get retried.
     try {
         const body = req.body;
 
@@ -264,7 +264,7 @@ router.post('/rtdn-webhook', async (req, res) => {
         const b64 = body?.message?.data;
         if (!b64) {
             console.warn('[rtdn-webhook] No message.data in payload');
-            return;
+            return res.sendStatus(200);
         }
 
         let notification;
@@ -273,13 +273,13 @@ router.post('/rtdn-webhook', async (req, res) => {
             notification = JSON.parse(json);
         } catch {
             console.warn('[rtdn-webhook] Failed to decode Pub/Sub message');
-            return;
+            return res.sendStatus(200);
         }
 
         const subNotification = notification?.subscriptionNotification;
         if (!subNotification) {
             // Could be a test notification or other type – ignore silently
-            return;
+            return res.sendStatus(200);
         }
 
         const { notificationType, purchaseToken } = subNotification;
@@ -300,23 +300,28 @@ router.post('/rtdn-webhook', async (req, res) => {
         switch (notificationType) {
             case 1: // RECOVERED
             case 2: // RENEWED
+            case 6: // GRACE_PERIOD (user keeps access while Google retries payment)
             case 7: // RESTARTED
                 await _handleRenewal(purchaseToken);
                 break;
 
-            case 3:  // CANCELED
+            case 3: // CANCELED – auto-renew turned off; access lasts until expiry
+                await _handleAutoRenewOff(purchaseToken);
+                break;
+
             case 5:  // ON_HOLD
-            case 6:  // GRACE_PERIOD (still usable – mark as grace_period)
             case 12: // EXPIRED
             case 13: // REVOKED
-                await _handleCancellation(purchaseToken, notificationType);
+                await _handleCancellation(purchaseToken);
                 break;
 
             default:
                 console.log(`[rtdn-webhook] Unhandled notificationType: ${notificationType}`);
         }
+        return res.sendStatus(200);
     } catch (err) {
         console.error('[rtdn-webhook] Error processing notification:', err);
+        return res.sendStatus(500);
     }
 });
 
@@ -386,10 +391,41 @@ async function _handleRenewal(purchaseToken) {
 }
 
 /**
+ * The user turned off auto-renew. They keep access until expiryDate, after
+ * which SUBSCRIPTION_EXPIRED (12) arrives and _handleCancellation runs.
+ */
+async function _handleAutoRenewOff(purchaseToken) {
+    const snap = await db
+        .collection('subscriptions')
+        .where('purchaseToken', '==', purchaseToken)
+        .get();
+
+    if (snap.empty) {
+        console.warn('[rtdn-webhook] No Firestore subscription found for token (auto-renew off)');
+        return;
+    }
+
+    const batch = db.batch();
+    for (const doc of snap.docs) {
+        if (doc.data().status === 'replaced') continue;
+        batch.update(doc.ref, { autoRenew: false, updatedAt: new Date() });
+
+        const garageId = doc.data().garageId;
+        if (garageId && await _garageTracksToken(garageId, purchaseToken)) {
+            batch.update(db.collection('garages').doc(garageId), {
+                'subscription.autoRenew': false,
+            });
+        }
+    }
+    await batch.commit();
+    console.log('[rtdn-webhook] Auto-renew turned off in Firestore');
+}
+
+/**
  * Mark subscription as canceled/expired in Firestore.
  */
-async function _handleCancellation(purchaseToken, notificationType) {
-    const status = notificationType === 6 ? 'grace_period' : 'canceled';
+async function _handleCancellation(purchaseToken) {
+    const status = 'canceled';
 
     const snap = await db
         .collection('subscriptions')
