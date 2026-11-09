@@ -94,8 +94,9 @@ Go to **Vercel Project → Settings → Environment Variables** and add:
 3. Set the topic ARN.
 4. Create a **push subscription** pointing to:
    ```
-   https://<your-vercel-domain>/api/payments/rtdn-webhook
+   https://<your-vercel-domain>/api/payments/rtdn-webhook?token=<RTDN_WEBHOOK_SECRET>
    ```
+   Set the same random value as the `RTDN_WEBHOOK_SECRET` env var on Vercel.
 5. Grant Pub/Sub SA the `pubsub.topics.publish` permission on the topic.
 
 ### Supported RTDN Notification Types

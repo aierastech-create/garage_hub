@@ -249,11 +249,20 @@ router.get('/subscription/:garageId', async (req, res) => {
  *  1. Create a Pub/Sub topic in Google Cloud Console.
  *  2. In Play Console → Monetization → Real-Time Dev Notifications, set the topic.
  *  3. Create a push subscription pointing to:
- *     https://<your-backend-domain>/api/payments/rtdn-webhook
+ *     https://<your-backend-domain>/api/payments/rtdn-webhook?token=<RTDN_WEBHOOK_SECRET>
+ *
+ * When RTDN_WEBHOOK_SECRET is set, requests without the matching ?token= are
+ * rejected, so only our Pub/Sub subscription can call this endpoint.
  *
  * Ref: https://developer.android.com/google/play/billing/rtdn-reference
  */
 router.post('/rtdn-webhook', async (req, res) => {
+    const secret = process.env.RTDN_WEBHOOK_SECRET;
+    if (secret && req.query.token !== secret) {
+        console.warn('[rtdn-webhook] Rejected request with missing/invalid token');
+        return res.sendStatus(403);
+    }
+
     // Process before responding: on Vercel the function is frozen as soon as
     // the response is sent, so work done after res.send() never finishes.
     // Pub/Sub re-delivers on non-2xx, so failures here get retried.
